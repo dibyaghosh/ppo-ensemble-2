@@ -29,7 +29,7 @@ def evaluate(actor_critic, obs_rms, env_name, seed, num_processes, eval_log_dir,
 
     while len(eval_episode_rewards) < 10:
         with torch.no_grad():
-            _, action, _, eval_recurrent_hidden_states = actor_critic.act(
+            _, action, _, eval_recurrent_hidden_states, _ = actor_critic.act(
                 obs,
                 eval_recurrent_hidden_states,
                 eval_masks,
