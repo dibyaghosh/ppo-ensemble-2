@@ -19,6 +19,13 @@ class FixedCategorical(torch.distributions.Categorical):
     def sample(self):
         return super().sample().unsqueeze(-1)
 
+    def kl(self, dist):
+        min_real = torch.finfo(self.logits.dtype).min
+        logits = torch.clamp(self.logits, min=min_real)
+        other_logits = torch.clamp(dist.logits, min=min_real)
+        p_log_p = (logits -  other_logits) * self.probs
+        return p_log_p.sum(-1)
+
     def log_probs(self, actions):
         return (
             super()
@@ -32,6 +39,21 @@ class FixedCategorical(torch.distributions.Categorical):
         return self.probs.argmax(dim=-1, keepdim=True)
 
 
+class MaxNormal:
+    def __init__(self, mus, scales, avg=False):
+        n_ensemble = mus.shape[1]
+        self.dists = [
+            FixedNormal(mus[:, i], scales[:, i])
+            for i in range(n_ensemble)
+        ]
+        self.avg = avg
+        assert not avg, 'Havent implemented avg yet'
+
+    def log_prob(self, actions):
+        all_log_probs = torch.stack([dist.log_prob(actions) for dist in self.dists], 0)
+        logp, _ = torch.max(all_log_probs, dim=0)
+        return logp
+
 # Normal
 class FixedNormal(torch.distributions.Normal):
     def log_probs(self, actions):
@@ -43,6 +65,13 @@ class FixedNormal(torch.distributions.Normal):
     def mode(self):
         return self.mean
 
+    def kl(self, dist):
+        N = 10
+        xs = self.rsample((N,))
+        logprobs = self.log_prob(xs)
+        other_logprobs = dist.log_prob(xs)
+        # print(other_logprobs.shape)
+        return (other_logprobs - logprobs).mean(0).sum(-1)
 
 # Bernoulli
 class FixedBernoulli(torch.distributions.Bernoulli):
@@ -88,9 +117,7 @@ class DiagGaussian(nn.Module):
 
         #  An ugly hack for my KFAC implementation.
         zeros = torch.zeros(action_mean.size())
-        if x.is_cuda:
-            zeros = zeros.cuda()
-
+        zeros = zeros.to(x)
         action_logstd = self.logstd(zeros)
         return FixedNormal(action_mean, action_logstd.exp())
 

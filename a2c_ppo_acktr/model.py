@@ -3,14 +3,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from a2c_ppo_acktr.distributions import Bernoulli, Categorical, DiagGaussian
+from a2c_ppo_acktr.distributions import Bernoulli, Categorical, DiagGaussian, FixedCategorical, FixedNormal, MaxNormal
 from a2c_ppo_acktr.utils import init
 
 
 class Flatten(nn.Module):
     def forward(self, x):
         return x.view(x.size(0), -1)
-
 
 class Policy(nn.Module):
     def __init__(self, obs_shape, action_space, base=None, base_kwargs=None):
@@ -52,8 +51,12 @@ class Policy(nn.Module):
         """Size of rnn_hx."""
         return self.base.recurrent_hidden_state_size
 
-    def get_dist(self, inputs, rnn_hxs, masks):
-        value, actor_features, rnn_hxs = self.base(inputs, rnn_hxs, masks)
+    def get_init_rnn_hxs(self, n_trajs, device):
+        return torch.zeros(
+            n_trajs, self.recurrent_hidden_state_size, device=device)
+
+    def get_dist(self, inputs, rnn_hxs, masks, last_actions):
+        value, actor_features, rnn_hxs = self.base(inputs, rnn_hxs, masks, last_actions)
         dist = self.dist(actor_features)
         return dist, rnn_hxs
 
@@ -71,7 +74,7 @@ class Policy(nn.Module):
 
         action_log_probs = dist.log_probs(action)
         # dist_entropy = dist.entropy().mean()
-        extra_info = dict()
+        extra_info = self.extra_info_template.copy()
         return value, action, action_log_probs, rnn_hxs, extra_info
 
     def get_value(self, inputs, rnn_hxs, masks, last_actions):
@@ -87,6 +90,126 @@ class Policy(nn.Module):
         aux_loss = torch.zeros_like(dist_entropy)
         return value, action_log_probs, dist_entropy, aux_loss, rnn_hxs
 
+class CombinedActorCritic:
+    def __init__(self, actor_critics, avg=False):
+        self.actor_critics = actor_critics
+        self.avg = avg
+        self.discrete = self.actor_critics[0].discrete
+        self.recurrent = self.is_recurrent
+    
+    def get_dist_params(self, inputs, all_rnn_hxs, masks, last_actions):
+        if all_rnn_hxs is None:
+            all_rnn_hxs = [None] * len(self.actor_critics)
+        new_rnn_hxs = []
+        dists = []
+        with torch.no_grad():
+            for e, ac in enumerate(self.actor_critics):
+                dist, rnn_hxs = ac.get_dist(inputs, all_rnn_hxs[e], masks, last_actions)
+                dists.append(dist)
+                new_rnn_hxs.append(rnn_hxs)
+            
+            if self.discrete:
+                params = torch.stack([dist.probs for dist in dists], dim=1)
+            else:
+                mus = torch.stack([dist.mean for dist in dists], dim=1)
+                scales = torch.stack([dist.stddev for dist in dists], dim=1)
+                params = torch.stack([mus, scales], dim=1)
+        return params, new_rnn_hxs
+
+    def get_init_rnn_hxs(self, n_trajs, device):
+        return [
+        torch.zeros(
+            n_trajs, actor_critic.recurrent_hidden_state_size, device=device)
+        for actor_critic in self.actor_critics
+        ]
+    
+    def __getattr__(self, attr):
+        f = getattr(self.actor_critics[0], attr)
+        if callable(f):
+            def g(*args, **kwargs):
+                print('Calling ', attr)
+                return [getattr(actor_critic, attr)(*args, **kwargs) for actor_critic in self.actor_critics][0]
+            return g
+        print('Getting ', attr)
+        return f
+    
+    def act(self, inputs, rnn_hxs, masks, last_actions, deterministic=False):        
+        if not self.recurrent:
+            if self.discrete and not self.avg: # MAX DISCRETE
+                all_probs, _ = self.get_dist_params(inputs, None, masks, last_actions)
+                probs = all_probs.max(dim=1)[0]
+                dist = FixedCategorical(probs=probs)
+                action = dist.sample()
+                action_log_dist = dist.logits
+                return 0, action, action_log_dist, rnn_hxs, dict()
+            else:
+                idx = np.random.choice(len(self.actor_critics))
+                return self.actor_critics[idx].act(inputs, rnn_hxs, masks, deterministic, last_actions)
+        else:
+            raise NotImplementedError()    
+
+    
+class DistPolicy(Policy):
+    def __init__(self, obs_shape, action_space, base=None, base_kwargs=None, n_ensemble=4, avg=False):
+        super().__init__(obs_shape, action_space, base, base_kwargs)
+        self.discrete = (action_space.__class__.__name__ == "Discrete")
+        self.n_ensemble = n_ensemble
+        self.avg = avg
+
+    def act(self, inputs, rnn_hxs, masks, last_actions, deterministic=False):
+        value, actor_features, rnn_hxs = self.base(inputs, rnn_hxs, masks, last_actions)
+        dist = self.dist(actor_features)
+
+        if deterministic:
+            action = dist.mode()
+        else:
+            action = dist.sample()
+
+        action_log_probs = dist.log_probs(action)
+        # dist_entropy = dist.entropy().mean()
+        if self.discrete:
+            extra_info = dict(other_dist_params=dist.probs.unsqueeze(1).repeat([1, self.n_ensemble, 1]))
+        else:
+            mu = dist.mean.unsqueeze(1).repeat([1, self.n_ensemble, 1])
+            std = dist.stddev.unsqueeze(1).repeat([1, self.n_ensemble, 1])
+            params = torch.stack([mu, std], dim=1)
+            extra_info = dict(other_dist_params=params)
+        return value, action, action_log_probs, rnn_hxs, extra_info
+
+    @property
+    def extra_info_template(self):
+        if self.discrete:
+            return dict(other_dist_params=torch.ones(self.n_ensemble, self.action_dim)) # Directly save probs
+        else:
+            return dict(other_dist_params=torch.ones(2, self.n_ensemble, self.action_dim)) # Have to save \mu, \sigma for all ensemble members if max
+
+    def evaluate_actions(self, inputs, rnn_hxs, masks, action, last_actions, extra_info):
+        value, actor_features, rnn_hxs = self.base(inputs, rnn_hxs, masks, last_actions)
+        dist = self.dist(actor_features)
+        action_log_probs = dist.log_probs(action)
+        dist_entropy = dist.entropy().mean()
+
+        # Computing aux_loss
+        if self.discrete:
+            all_other_probs = extra_info['other_dist_params']
+            if not self.avg: # MAX
+                other_probs, _ = torch.max(all_other_probs, dim=1)
+            else:
+                other_probs = torch.mean(all_other_probs, dim=1)
+            other_dist = FixedCategorical(probs=other_probs)
+            if np.random.rand() < 0.02:
+                print(dist.kl(other_dist).mean(), np.log(self.num_actions) - dist.entropy().mean(), torch.max(other_dist.probs), torch.max(dist.probs))
+            aux_loss = dist.kl(other_dist).mean()
+        else:
+            other_dist_params = extra_info['other_dist_params']
+            other_mu, other_scale = other_dist_params[:, 0], other_dist_params[:, 1]
+            other_dist = MaxNormal(other_mu, other_scale, avg=self.avg)
+            kls = dist.kl(other_dist)
+            aux_loss = kls.mean()
+            if np.random.rand() < 0.005:
+                print(f'Mean: {kls.mean()}, Max: {kls.max()}, Min: {kls.min()}')
+        dist_entropy = dist.entropy().mean()
+        return value, action_log_probs, dist_entropy, aux_loss, rnn_hxs
 
 class NNBase(nn.Module):
     def __init__(self, recurrent, recurrent_input_size, hidden_size, action_dim):

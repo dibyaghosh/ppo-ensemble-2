@@ -18,8 +18,8 @@ def evaluate(actor_critic, obs_rms, env_name, seed, num_processes, eval_log_dir,
     eval_episode_rewards = []
 
     obs = eval_envs.reset()
-    eval_recurrent_hidden_states = torch.zeros(
-        num_processes, actor_critic.recurrent_hidden_state_size, device=device)
+    eval_recurrent_hidden_states = actor_critic.get_init_rnn_hxs(num_processes, device) #torch.zeros(
+        # num_processes, actor_critic.recurrent_hidden_state_size, device=device)
     eval_masks = torch.zeros(num_processes, 1, device=device)
 
     # Last Actions

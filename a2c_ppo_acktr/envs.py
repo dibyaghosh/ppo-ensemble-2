@@ -47,7 +47,8 @@ def make_env(env_id, seed, rank, log_dir, allow_early_resets):
             env = NoopResetEnv(env, noop_max=30)
             env = MaxAndSkipEnv(env, skip=4)
 
-        env.seed(seed + rank)
+        # env.seed(seed + rank)
+        env.seed(seed)
 
         if str(env.__class__.__name__).find('TimeLimit') >= 0:
             env = TimeLimitMask(env)

@@ -159,6 +159,35 @@ def get_args():
         help='aux term coefficient (default: 0)')
     parser.add_argument(
         '--eval-env-name', default=None, help='Which env to evaluate in (default is to use --env-name)')
+
+    # DIST SPECIFIC
+    parser.add_argument(
+        '--diff-gpu',
+        action='store_true',
+        default=False,
+        help='Distribute ensemble members across GPUs (useful for image-based things)')
+    parser.add_argument(
+        "--port", 
+        type=int, 
+        default=29500,
+        help="which port to run distributed server on")
+    parser.add_argument(
+        "--avg", 
+        action="store_true",
+        help="Whether to use avg instead of max")
+    parser.add_argument(
+        "--n-ensemble", 
+        type=int, 
+        default=2,
+        help="# of policies in ensemble")
+    parser.add_argument(
+        "--sync-interval", 
+        type=int, 
+        default=1,
+        help="Sync every n PPO updates (n=1 makes the most sense, but larger may be faster)")
+    # END SPECIFIC
+
+
     args = parser.parse_args()
 
     args.cuda = not args.no_cuda and torch.cuda.is_available()
