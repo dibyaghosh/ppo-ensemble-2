@@ -1,5 +1,13 @@
 # pytorch-a2c-ppo-acktr
 
+## Instructions 
+
+To run the ensembling thing, run `main_dist.py` instead of `main.py`: there are a few specific arguments for this `--n-ensemble=4 --aux-coef=0.0` that you should specify. 
+
+If you implement the `env.seed()`  function in your gym Env to do environment bootstrapping (subsampling levels or whatever), I *think* different ensemble members should learn on different subsamples? But I haven't tried it out myself
+
+I'd recommend you pass your eyes over `a2c_ppo_acktr/arguments.py` just to see what new hyperparameters I added.
+
 ## Update (April 12th, 2021)
 
 PPO is great, but [Soft Actor Critic](https://arxiv.org/abs/1812.05905) can be better for many continuous control tasks. Please check out [my new RL](http://github.com/ikostrikov/jax-rl) repository in jax.
