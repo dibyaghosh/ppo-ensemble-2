@@ -149,13 +149,27 @@ def get_args():
         action='store_true',
         default=False,
         help='use a linear schedule on the learning rate')
+
+
+    # NEW ARGS
+    parser.add_argument(
+        '--aux-coef',
+        type=float,
+        default=0.0,
+        help='aux term coefficient (default: 0)')
+    parser.add_argument(
+        '--eval-env-name', default=None, help='Which env to evaluate in (default is to use --env-name)')
     args = parser.parse_args()
 
     args.cuda = not args.no_cuda and torch.cuda.is_available()
+
 
     assert args.algo in ['a2c', 'ppo', 'acktr']
     if args.recurrent_policy:
         assert args.algo in ['a2c', 'ppo'], \
             'Recurrent policy is not implemented for ACKTR'
 
+
+    if args.eval_env_name is None:
+        args.eval_env_name = args.env_name
     return args

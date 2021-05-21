@@ -64,6 +64,7 @@ def main():
             args.num_mini_batch,
             args.value_loss_coef,
             args.entropy_coef,
+            args.aux_coef,
             lr=args.lr,
             eps=args.eps,
             max_grad_norm=args.max_grad_norm)
@@ -91,11 +92,23 @@ def main():
 
     rollouts = RolloutStorage(args.num_steps, args.num_processes,
                               envs.observation_space.shape, envs.action_space,
-                              actor_critic.recurrent_hidden_state_size)
+                              actor_critic.recurrent_hidden_state_size, extra_info_template=actor_critic.extra_info_template)
 
     obs = envs.reset()
     rollouts.obs[0].copy_(obs)
     rollouts.to(device)
+    expl_returns = []
+    eval_returns = []
+
+    def save_returns():
+        save_path = os.path.join(args.save_dir, args.algo)
+        try:
+            os.makedirs(save_path)
+        except OSError:
+            pass
+        print('Saving Returns to ', save_path)
+        np.savez(os.path.join(save_path, 'returns.npz'), exploration=np.array(expl_returns), evaluation=np.array(eval_returns))
+
 
     episode_rewards = deque(maxlen=10)
 
@@ -113,9 +126,9 @@ def main():
         for step in range(args.num_steps):
             # Sample actions
             with torch.no_grad():
-                value, action, action_log_prob, recurrent_hidden_states = actor_critic.act(
+                value, action, action_log_prob, recurrent_hidden_states, extra_info = actor_critic.act(
                     rollouts.obs[step], rollouts.recurrent_hidden_states[step],
-                    rollouts.masks[step])
+                    rollouts.masks[step], rollouts.last_actions[step])
 
             # Obser reward and next obs
             obs, reward, done, infos = envs.step(action)
@@ -123,6 +136,7 @@ def main():
             for info in infos:
                 if 'episode' in info.keys():
                     episode_rewards.append(info['episode']['r'])
+                    expl_returns.append(info['episode']['r'])
 
             # If done then clean the history of observations.
             masks = torch.FloatTensor(
@@ -131,12 +145,12 @@ def main():
                 [[0.0] if 'bad_transition' in info.keys() else [1.0]
                  for info in infos])
             rollouts.insert(obs, recurrent_hidden_states, action,
-                            action_log_prob, value, reward, masks, bad_masks)
+                            action_log_prob, value, reward, masks, bad_masks, extra_info)
 
         with torch.no_grad():
             next_value = actor_critic.get_value(
                 rollouts.obs[-1], rollouts.recurrent_hidden_states[-1],
-                rollouts.masks[-1]).detach()
+                rollouts.masks[-1], rollouts.last_actions[-1]).detach()
 
         if args.gail:
             if j >= 10:
@@ -157,7 +171,7 @@ def main():
         rollouts.compute_returns(next_value, args.use_gae, args.gamma,
                                  args.gae_lambda, args.use_proper_time_limits)
 
-        value_loss, action_loss, dist_entropy = agent.update(rollouts)
+        value_loss, action_loss, dist_entropy, aux_loss = agent.update(rollouts)
 
         rollouts.after_update()
 
@@ -190,8 +204,15 @@ def main():
         if (args.eval_interval is not None and len(episode_rewards) > 1
                 and j % args.eval_interval == 0):
             obs_rms = utils.get_vec_normalize(envs).obs_rms
-            evaluate(actor_critic, obs_rms, args.env_name, args.seed,
+            new_eval_returns = evaluate(actor_critic, obs_rms, args.eval_env_name, args.seed,
                      args.num_processes, eval_log_dir, device)
+            eval_returns.append(new_eval_returns)
+            save_returns()
+        elif j % 10 == 0:
+            save_returns()
+
+
+            
 
 
 if __name__ == "__main__":

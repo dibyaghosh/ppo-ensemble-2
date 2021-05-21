@@ -8,7 +8,7 @@ def _flatten_helper(T, N, _tensor):
 
 class RolloutStorage(object):
     def __init__(self, num_steps, num_processes, obs_shape, action_space,
-                 recurrent_hidden_state_size):
+                 recurrent_hidden_state_size, extra_info_template):
         self.obs = torch.zeros(num_steps + 1, num_processes, *obs_shape)
         self.recurrent_hidden_states = torch.zeros(
             num_steps + 1, num_processes, recurrent_hidden_state_size)
@@ -18,8 +18,14 @@ class RolloutStorage(object):
         self.action_log_probs = torch.zeros(num_steps, num_processes, 1)
         if action_space.__class__.__name__ == 'Discrete':
             action_shape = 1
+            action_dim = action_space.n
+            self.discrete = True
+
         else:
             action_shape = action_space.shape[0]
+            action_dim = action_space.shape[0]
+            self.discrete = False
+
         self.actions = torch.zeros(num_steps, num_processes, action_shape)
         if action_space.__class__.__name__ == 'Discrete':
             self.actions = self.actions.long()
@@ -28,6 +34,13 @@ class RolloutStorage(object):
         # Masks that indicate whether it's a true terminal state
         # or time limit end state
         self.bad_masks = torch.ones(num_steps + 1, num_processes, 1)
+
+        self.last_actions = torch.zeros(num_steps + 1, num_processes, action_dim)
+        self.extra_info = {
+            k: torch.zeros(num_steps, num_processes, *v.shape, dtype=v.dtype)
+            for k, v in extra_info_template.items()
+        } # Added
+
 
         self.num_steps = num_steps
         self.step = 0
@@ -43,8 +56,11 @@ class RolloutStorage(object):
         self.masks = self.masks.to(device)
         self.bad_masks = self.bad_masks.to(device)
 
+        self.last_actions = self.last_actions.to(device)
+        self.extra_info = {k: v.to(device) for k, v in self.extra_info.items()}
+
     def insert(self, obs, recurrent_hidden_states, actions, action_log_probs,
-               value_preds, rewards, masks, bad_masks):
+               value_preds, rewards, masks, bad_masks, extra_info):
         self.obs[self.step + 1].copy_(obs)
         self.recurrent_hidden_states[self.step +
                                      1].copy_(recurrent_hidden_states)
@@ -55,6 +71,14 @@ class RolloutStorage(object):
         self.masks[self.step + 1].copy_(masks)
         self.bad_masks[self.step + 1].copy_(bad_masks)
 
+        if self.discrete:
+            self.last_actions[self.step + 1].zero_()
+            self.last_actions[self.step + 1][torch.arange(self.last_actions.shape[1]), actions] = 1
+        else:
+            self.last_actions[self.step + 1].copy_(actions)
+        for k, v in extra_info.items():
+            self.extra_info[k][self.step].copy_(v)
+
         self.step = (self.step + 1) % self.num_steps
 
     def after_update(self):
@@ -62,6 +86,7 @@ class RolloutStorage(object):
         self.recurrent_hidden_states[0].copy_(self.recurrent_hidden_states[-1])
         self.masks[0].copy_(self.masks[-1])
         self.bad_masks[0].copy_(self.bad_masks[-1])
+        self.last_actions[0].copy_(self.last_actions[-1])
 
     def compute_returns(self,
                         next_value,
@@ -139,8 +164,13 @@ class RolloutStorage(object):
             else:
                 adv_targ = advantages.view(-1, 1)[indices]
 
+            last_action_batch = self.last_actions[:-1].view(-1, self.last_actions.size(-1))[indices]
+            extra_info_batch = {
+                k: v.view(-1, *v.size()[2:])[indices]
+                for k, v in self.extra_info.items()
+            }
             yield obs_batch, recurrent_hidden_states_batch, actions_batch, \
-                value_preds_batch, return_batch, masks_batch, old_action_log_probs_batch, adv_targ
+                value_preds_batch, return_batch, masks_batch, old_action_log_probs_batch, adv_targ, last_action_batch, extra_info_batch
 
     def recurrent_generator(self, advantages, num_mini_batch):
         num_processes = self.rewards.size(1)
@@ -160,6 +190,10 @@ class RolloutStorage(object):
             old_action_log_probs_batch = []
             adv_targ = []
 
+            last_actions_batch = []
+            extra_info_batch = {k: list() for k in self.extra_info}
+
+
             for offset in range(num_envs_per_batch):
                 ind = perm[start_ind + offset]
                 obs_batch.append(self.obs[:-1, ind])
@@ -172,6 +206,10 @@ class RolloutStorage(object):
                 old_action_log_probs_batch.append(
                     self.action_log_probs[:, ind])
                 adv_targ.append(advantages[:, ind])
+
+                last_actions_batch.append(self.last_actions[:-1, ind])
+                for k in self.extra_info:
+                    extra_info_batch[k].append(self.extra_info[k][:, ind])
 
             T, N = self.num_steps, num_envs_per_batch
             # These are all tensors of size (T, N, -1)
@@ -187,6 +225,9 @@ class RolloutStorage(object):
             # States is just a (N, -1) tensor
             recurrent_hidden_states_batch = torch.stack(
                 recurrent_hidden_states_batch, 1).view(N, -1)
+            last_actions_batch = torch.stack(last_actions_batch, 1)
+            for k in extra_info_batch:
+                extra_info_batch[k] = torch.stack(extra_info_batch[k], 1)
 
             # Flatten the (T, N, ...) tensors to (T * N, ...)
             obs_batch = _flatten_helper(T, N, obs_batch)
@@ -198,5 +239,9 @@ class RolloutStorage(object):
                     old_action_log_probs_batch)
             adv_targ = _flatten_helper(T, N, adv_targ)
 
+            last_actions_batch = _flatten_helper(T, N, last_actions_batch)
+            for k in extra_info_batch:
+                extra_info_batch[k] = _flatten_helper(T, N, extra_info_batch[k])
+
             yield obs_batch, recurrent_hidden_states_batch, actions_batch, \
-                value_preds_batch, return_batch, masks_batch, old_action_log_probs_batch, adv_targ
+                value_preds_batch, return_batch, masks_batch, old_action_log_probs_batch, adv_targ, last_actions_batch, extra_info_batch

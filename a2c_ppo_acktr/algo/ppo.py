@@ -12,6 +12,7 @@ class PPO():
                  num_mini_batch,
                  value_loss_coef,
                  entropy_coef,
+                 aux_coef,
                  lr=None,
                  eps=None,
                  max_grad_norm=None,
@@ -25,6 +26,7 @@ class PPO():
 
         self.value_loss_coef = value_loss_coef
         self.entropy_coef = entropy_coef
+        self.aux_coef = aux_coef
 
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
@@ -39,6 +41,7 @@ class PPO():
         value_loss_epoch = 0
         action_loss_epoch = 0
         dist_entropy_epoch = 0
+        aux_loss_epoch = 0
 
         for e in range(self.ppo_epoch):
             if self.actor_critic.is_recurrent:
@@ -51,12 +54,12 @@ class PPO():
             for sample in data_generator:
                 obs_batch, recurrent_hidden_states_batch, actions_batch, \
                    value_preds_batch, return_batch, masks_batch, old_action_log_probs_batch, \
-                        adv_targ = sample
+                        adv_targ, last_actions_batch, extra_info_batch = sample
 
                 # Reshape to do in a single forward pass for all steps
-                values, action_log_probs, dist_entropy, _ = self.actor_critic.evaluate_actions(
+                values, action_log_probs, dist_entropy, aux_loss, _ = self.actor_critic.evaluate_actions(
                     obs_batch, recurrent_hidden_states_batch, masks_batch,
-                    actions_batch)
+                    actions_batch, last_actions_batch, extra_info_batch)
 
                 ratio = torch.exp(action_log_probs -
                                   old_action_log_probs_batch)
@@ -78,7 +81,7 @@ class PPO():
 
                 self.optimizer.zero_grad()
                 (value_loss * self.value_loss_coef + action_loss -
-                 dist_entropy * self.entropy_coef).backward()
+                 dist_entropy * self.entropy_coef + aux_loss * self.aux_coef).backward()
                 nn.utils.clip_grad_norm_(self.actor_critic.parameters(),
                                          self.max_grad_norm)
                 self.optimizer.step()
@@ -86,11 +89,13 @@ class PPO():
                 value_loss_epoch += value_loss.item()
                 action_loss_epoch += action_loss.item()
                 dist_entropy_epoch += dist_entropy.item()
+                aux_loss_epoch += aux_loss.item()
 
         num_updates = self.ppo_epoch * self.num_mini_batch
 
         value_loss_epoch /= num_updates
         action_loss_epoch /= num_updates
         dist_entropy_epoch /= num_updates
+        aux_loss_epoch /= num_updates
 
-        return value_loss_epoch, action_loss_epoch, dist_entropy_epoch
+        return value_loss_epoch, action_loss_epoch, dist_entropy_epoch, aux_loss_epoch
