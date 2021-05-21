@@ -90,6 +90,9 @@ def main():
             shuffle=True,
             drop_last=drop_last)
 
+    print(actor_critic)
+    print(device)
+    
     rollouts = RolloutStorage(args.num_steps, args.num_processes,
                               envs.observation_space.shape, envs.action_space,
                               actor_critic.recurrent_hidden_state_size, extra_info_template=actor_critic.extra_info_template)
